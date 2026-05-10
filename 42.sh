@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.1"
+APP_VERSION="1.2"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -119,22 +119,63 @@ run_parallel() {
 
     local pids=()
     local ct_arr=($ct_list)
+    local ok=0 skipped=0 failed=0
+    local failed_ids=()
+    local total=${#ct_arr[@]} done_count=0
+    local printed_ids=" "
+
+    _print_finished_cts() {
+        local ctid out stat_file status
+        for ctid in "${ct_arr[@]}"; do
+            [[ "$printed_ids" == *" ${ctid} "* ]] && continue
+
+            out="$tmpdir/${ctid}.out"
+            stat_file="$tmpdir/${ctid}.status"
+            [[ -f "$stat_file" ]] || continue
+
+            status=$(cat "$stat_file")
+            (( done_count++ ))
+            echo -e "  ${DIM}[${done_count}/${total}] CT ${ctid}${NC}"
+
+            if [[ -s "$out" ]]; then
+                cat "$out"
+            fi
+
+            case "$status" in
+                ok)   (( ok++ ))      ;;
+                skip) (( skipped++ )) ;;
+                fail) (( failed++ )); failed_ids+=("$ctid") ;;
+            esac
+
+            printed_ids+="${ctid} "
+            echo ""
+        done
+    }
 
     for ctid in "${ct_arr[@]}"; do
         # Chờ token (giới hạn luồng)
         read -u 9
+        _print_finished_cts
 
         (
             # Chạy worker, output vào tmpfile
             "$worker" "$ctid" "$tmpdir" "${extra_args[@]}" \
                 > "$tmpdir/${ctid}.out" 2>&1
+            if [[ ! -f "$tmpdir/${ctid}.status" ]]; then
+                echo "fail" > "$tmpdir/${ctid}.status"
+            fi
             # Trả token
             echo >&9
         ) &
         pids+=($!)
     done
 
-    # Chờ tất cả xong
+    while (( done_count < total )); do
+        _print_finished_cts
+        sleep 1
+    done
+
+    # Chờ tất cả process kết thúc hẳn
     for pid in "${pids[@]}"; do
         wait "$pid"
     done
@@ -144,29 +185,18 @@ run_parallel() {
     kill "$sem_pid" 2>/dev/null
     wait "$sem_pid" 2>/dev/null
 
-    # In output theo thứ tự CT ID
-    local ok=0 skipped=0 failed=0
-    for ctid in "${ct_arr[@]}"; do
-        local out="$tmpdir/${ctid}.out"
-        local stat_file="$tmpdir/${ctid}.status"
-        local status="unknown"
-        [[ -f "$stat_file" ]] && status=$(cat "$stat_file")
-
-        if [[ -s "$out" ]]; then
-            cat "$out"
-        fi
-
-        case "$status" in
-            ok)   (( ok++ ))      ;;
-            skip) (( skipped++ )) ;;
-            fail) (( failed++ ))  ;;
-        esac
-    done
-
     rm -rf "$tmpdir"
 
     # Trả tổng kết ra stdout để caller dùng
-    echo "__STATS__ ok=$ok skipped=$skipped failed=$failed"
+    if [[ -n "${RUN_PARALLEL_STATS_FILE:-}" ]]; then
+        {
+            echo "__STATS__ ok=$ok skipped=$skipped failed=$failed"
+            echo "__FAILED__ ${failed_ids[*]}"
+        } > "$RUN_PARALLEL_STATS_FILE"
+    else
+        echo "__STATS__ ok=$ok skipped=$skipped failed=$failed"
+        echo "__FAILED__ ${failed_ids[*]}"
+    fi
 }
 
 # ─────────────────────────────────────────────
@@ -300,16 +330,23 @@ _worker_ct_power() {
     fi
 
     local run_action="$action"
-    if [[ "$action" == "restart" ]] && echo "$status" | grep -q "stopped"; then
-        run_action="start"
+    if [[ "$action" == "restart" ]]; then
+        if echo "$status" | grep -q "stopped"; then
+            run_action="start"
+        else
+            run_action="reboot"
+        fi
     fi
 
+    local cmd_output
     echo -ne "  ${!color}[${run_action}]${NC} CT ${ctid} ... "
-    if pct "$run_action" "$ctid" 2>&1; then
+    if cmd_output=$(pct "$run_action" "$ctid" 2>&1); then
         echo -e "  ${GREEN}✓${NC}"
+        [[ -n "$cmd_output" ]] && echo "$cmd_output" | sed "s/^/  ${DIM}/; s/$/${NC}/"
         echo "ok" > "$tmpdir/${ctid}.status"
     else
         echo -e "  ${RED}✗${NC}"
+        [[ -n "$cmd_output" ]] && echo -e "  ${RED}Lỗi:${NC} $cmd_output"
         echo "fail" > "$tmpdir/${ctid}.status"
     fi
 }
@@ -342,24 +379,54 @@ _prompt_and_run() {
     echo -e "  ${DIM}Sẽ xử lý ${WHITE}${#ct_arr[@]} CT${DIM}:${NC} ${ct_list}"
     local threads
     threads=$(ask_threads)
-    echo ""
-    echo -e "  ${GREEN}▶ Bắt đầu với ${threads} luồng...${NC}"
-    echo -e "${DIM}  ─────────────────────────────────────${NC}"
-    echo ""
+    local run_list="$ct_list"
+    local attempt=1
 
-    local stats
-    stats=$(run_parallel "$threads" "$ct_list" "$worker" "${extra_args[@]}")
-    local ok skipped failed
-    ok=$(echo    "$stats" | grep -oP 'ok=\K[0-9]+')
-    skipped=$(echo "$stats" | grep -oP 'skipped=\K[0-9]+')
-    failed=$(echo  "$stats" | grep -oP 'failed=\K[0-9]+')
+    while true; do
+        echo ""
+        if (( attempt == 1 )); then
+            echo -e "  ${GREEN}▶ Bắt đầu với ${threads} luồng...${NC}"
+        else
+            echo -e "  ${YELLOW}↻ Chạy lại lần ${attempt} với ${threads} luồng...${NC}"
+        fi
+        echo -e "${DIM}  ─────────────────────────────────────${NC}"
+        echo ""
 
-    echo -e "${DIM}  ─────────────────────────────────────${NC}"
-    local summary="  ${GREEN}✓ Hoàn thành:${NC} ${WHITE}${ok} CT OK${NC}"
-    [[ "$failed"  -gt 0 ]] && summary+=", ${RED}${failed} thất bại${NC}"
-    [[ "$skipped" -gt 0 ]] && summary+=", ${DIM}${skipped} bỏ qua${NC}"
-    echo -e "$summary"
-    echo ""
+        local stats stats_file
+        stats_file=$(mktemp /tmp/42_stats_XXXXXX)
+        RUN_PARALLEL_STATS_FILE="$stats_file" run_parallel "$threads" "$run_list" "$worker" "${extra_args[@]}"
+        stats=$(cat "$stats_file")
+        rm -f "$stats_file"
+
+        local ok skipped failed failed_list
+        ok=$(echo    "$stats" | grep -oP 'ok=\K[0-9]+')
+        skipped=$(echo "$stats" | grep -oP 'skipped=\K[0-9]+')
+        failed=$(echo  "$stats" | grep -oP 'failed=\K[0-9]+')
+        failed_list=$(echo "$stats" | sed -n 's/^__FAILED__ //p' | head -1)
+
+        echo -e "${DIM}  ─────────────────────────────────────${NC}"
+        local summary="  ${GREEN}✓ Hoàn thành:${NC} ${WHITE}${ok} CT OK${NC}"
+        [[ "$failed"  -gt 0 ]] && summary+=", ${RED}${failed} thất bại${NC}"
+        [[ "$skipped" -gt 0 ]] && summary+=", ${DIM}${skipped} bỏ qua${NC}"
+        echo -e "$summary"
+
+        if [[ "$failed" -gt 0 && -n "$failed_list" ]]; then
+            echo ""
+            echo -e "  ${RED}CT thất bại:${NC} ${WHITE}${failed_list}${NC}"
+            echo -e "  ${DIM}Copy list:${NC} ${failed_list}"
+            echo ""
+            echo -ne "  ${YELLOW}Chạy lại các CT thất bại? (y/N): ${NC}"
+            read -r retry_confirm
+            if [[ "$retry_confirm" =~ ^[yY]$ ]]; then
+                run_list="$failed_list"
+                (( attempt++ ))
+                continue
+            fi
+        fi
+
+        echo ""
+        break
+    done
 }
 
 # ─────────────────────────────────────────────
@@ -589,7 +656,7 @@ cmd_check_network() {
     local lost_list="${lost[*]}"
     local stats
     stats=$(run_parallel "$threads" "$lost_list" "_worker_renew_dhcp" "$LEASE_FILE")
-    echo "$stats" | sed '/^__STATS__/d'
+    echo "$stats" | sed '/^__STATS__/d;/^__FAILED__/d'
 
     local r_ok r_fail
     r_ok=$(echo   "$stats" | grep -oP 'ok=\K[0-9]+')
