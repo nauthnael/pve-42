@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.0"
+APP_VERSION="1.1"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -28,7 +28,7 @@ MENU_FUNCS=()
 MENU_NAMES+=("Aro Report");         MENU_DESCS+=("Chạy aro-manager.sh report trên các CT đang running");          MENU_FUNCS+=("cmd_aro_report")
 MENU_NAMES+=("Aro Update");         MENU_DESCS+=("Tải & chạy aro-manager.sh update (có retry wget)");             MENU_FUNCS+=("cmd_aro_update")
 MENU_NAMES+=("Aro Restart");        MENU_DESCS+=("Chạy aro-manager.sh restart trên các CT đang running");         MENU_FUNCS+=("cmd_aro_restart")
-MENU_NAMES+=("CT Start");           MENU_DESCS+=("Khởi động các CT (pct start)");                                 MENU_FUNCS+=("cmd_ct_start")
+MENU_NAMES+=("CT Restart");         MENU_DESCS+=("Restart CT đang chạy, CT đang off thì start");                  MENU_FUNCS+=("cmd_ct_restart")
 MENU_NAMES+=("CT Stop");            MENU_DESCS+=("Tắt các CT (pct stop)");                                        MENU_FUNCS+=("cmd_ct_stop")
 MENU_NAMES+=("Aro Update Watchdog");MENU_DESCS+=("Tải & chạy aro-manager.sh update --watchdog-only (có retry)");  MENU_FUNCS+=("cmd_aro_update_watchdog")
 MENU_NAMES+=("Open VNC");           MENU_DESCS+=("Thêm iptables forward VNC cho CT (tự xóa sau 2h)");             MENU_FUNCS+=("cmd_open_vnc")
@@ -299,8 +299,13 @@ _worker_ct_power() {
         echo "skip" > "$tmpdir/${ctid}.status"; return
     fi
 
-    echo -ne "  ${!color}[${action}]${NC} CT ${ctid} ... "
-    if pct "$action" "$ctid" 2>&1; then
+    local run_action="$action"
+    if [[ "$action" == "restart" ]] && echo "$status" | grep -q "stopped"; then
+        run_action="start"
+    fi
+
+    echo -ne "  ${!color}[${run_action}]${NC} CT ${ctid} ... "
+    if pct "$run_action" "$ctid" 2>&1; then
         echo -e "  ${GREEN}✓${NC}"
         echo "ok" > "$tmpdir/${ctid}.status"
     else
@@ -365,7 +370,7 @@ cmd_aro_report()  { _prompt_and_run "Aro Report"  "CYAN"    "_worker_aro_run"  "
 cmd_aro_restart() { _prompt_and_run "Aro Restart" "RED"     "_worker_aro_run"  "restart" "RED";    }
 cmd_aro_update()  { _prompt_and_run "Aro Update"  "YELLOW"  "_worker_aro_update";                  }
 cmd_aro_update_watchdog() { _prompt_and_run "Aro Update Watchdog" "CYAN" "_worker_aro_watchdog";   }
-cmd_ct_start()    { _prompt_and_run "CT Start"    "GREEN"   "_worker_ct_power" "start"  "GREEN";   }
+cmd_ct_restart()  { _prompt_and_run "CT Restart"  "GREEN"   "_worker_ct_power" "restart" "GREEN";  }
 cmd_ct_stop()     { _prompt_and_run "CT Stop"     "RED"     "_worker_ct_power" "stop"   "RED";     }
 
 # ── Open VNC (không dùng parallel vì mỗi CT cần logic riêng với iptables) ──
