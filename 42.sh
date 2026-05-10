@@ -16,6 +16,8 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
+APP_VERSION="1.0"
+
 # ─────────────────────────────────────────────
 #  MENU ITEMS
 # ─────────────────────────────────────────────
@@ -475,6 +477,26 @@ cmd_open_vnc() {
 }
 
 # ── Check Network CT ──
+_get_ct_ipv4() {
+    local ctid="$1"
+    pct exec "$ctid" -- bash -c \
+        "ip -4 -o addr show dev eth0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1" 2>/dev/null
+}
+
+_get_ct_lease_ip() {
+    local ctid="$1" lease_file="$2"
+    [[ ! -f "$lease_file" ]] && return
+
+    local mac
+    mac=$(pct config "$ctid" 2>/dev/null \
+        | grep -E '^net[0-9]+:' \
+        | grep -oP 'hwaddr=\K[0-9A-Fa-f:]+' \
+        | head -1 | tr '[:upper:]' '[:lower:]')
+
+    [[ -z "$mac" ]] && return
+    grep -i "$mac" "$lease_file" | awk '{print $3}' | tail -1
+}
+
 cmd_check_network() {
     local LEASE_FILE="/var/lib/misc/dnsmasq.leases"
 
@@ -485,7 +507,8 @@ cmd_check_network() {
     echo ""
 
     if [[ ! -f "$LEASE_FILE" ]]; then
-        echo -e "  ${RED}✗ Không tìm thấy $LEASE_FILE${NC}\n"; return 1
+        echo -e "  ${YELLOW}⚠ Không tìm thấy $LEASE_FILE, sẽ kiểm tra IP trực tiếp trong CT.${NC}"
+        echo ""
     fi
 
     echo -e "  ${DIM}Kết hợp dãy và số lẻ (vd: ${WHITE}220-222,225,230-232${DIM}):${NC}"
@@ -514,24 +537,19 @@ cmd_check_network() {
         fi
         (( total++ ))
 
-        local mac
-        mac=$(pct config "$ctid" 2>/dev/null \
-            | grep -E '^net[0-9]+:' \
-            | grep -oP 'hwaddr=\K[0-9A-Fa-f:]+' \
-            | head -1 | tr '[:upper:]' '[:lower:]')
+        local ct_ip lease_ip
+        ct_ip=$(_get_ct_ipv4 "$ctid")
+        lease_ip=$(_get_ct_lease_ip "$ctid" "$LEASE_FILE")
 
-        if [[ -z "$mac" ]]; then
-            echo -e "  ${YELLOW}[?]${NC} CT $ctid — không đọc được MAC"
-            lost+=("$ctid"); continue
-        fi
-
-        local lease_ip
-        lease_ip=$(grep -i "$mac" "$LEASE_FILE" | awk '{print $3}')
-
-        if [[ -z "$lease_ip" ]]; then
-            echo -e "  ${RED}[✗]${NC} CT $ctid — ${RED}không có lease DHCP${NC} (MAC: $mac)"
+        if [[ -z "$ct_ip" ]]; then
+            if [[ -n "$lease_ip" ]]; then
+                echo -e "  ${RED}[✗]${NC} CT $ctid — ${RED}không có IP trong CT${NC} ${DIM}(lease cũ: $lease_ip)${NC}"
+            else
+                echo -e "  ${RED}[✗]${NC} CT $ctid — ${RED}không có IP trên eth0${NC}"
+            fi
             lost+=("$ctid")
         else
+            echo -e "  ${GREEN}[✓]${NC} CT $ctid — IP: ${WHITE}${ct_ip}${NC}"
             (( ok++ ))
         fi
     done
@@ -594,20 +612,13 @@ _worker_renew_dhcp() {
         return
     fi
 
-    local mac new_ip attempt
-    mac=$(pct config "$ctid" 2>/dev/null \
-        | grep -E '^net[0-9]+:' \
-        | grep -oP 'hwaddr=\K[0-9A-Fa-f:]+' \
-        | head -1 | tr '[:upper:]' '[:lower:]')
+    local new_ip attempt
 
     for attempt in $(seq 1 10); do
-        if [[ -n "$mac" && -f "$lease_file" ]]; then
-            new_ip=$(grep -i "$mac" "$lease_file" | awk '{print $3}' | tail -1)
-        fi
+        new_ip=$(_get_ct_ipv4 "$ctid")
         [[ -n "$new_ip" ]] && break
 
-        new_ip=$(pct exec "$ctid" -- bash -c \
-            "ip -4 -o addr show dev eth0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1" 2>/dev/null)
+        new_ip=$(_get_ct_lease_ip "$ctid" "$lease_file")
         [[ -n "$new_ip" ]] && break
 
         sleep 1
@@ -809,22 +820,33 @@ draw_header() {
     echo ""
     echo -e "${BOLD}${MAGENTA}  ╔══════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${MAGENTA}  ║${NC}  ${WHITE}${BOLD}✦  PROXMOX QUICK COMMANDS  ✦${NC}       ${BOLD}${MAGENTA}║${NC}"
+    echo -e "${BOLD}${MAGENTA}  ║${NC}              ${DIM}version ${APP_VERSION}${NC}              ${BOLD}${MAGENTA}║${NC}"
     echo -e "${BOLD}${MAGENTA}  ╚══════════════════════════════════════╝${NC}"
     echo -e "  ${DIM}$(hostname) · $(date '+%Y-%m-%d %H:%M')${NC}"
     echo ""
 }
 
 draw_menu() {
-    echo -e "  ${CYAN}────────────────────────────────────────${NC}"
+    echo -e "  ${CYAN}────────────────────────────────────────────────────────────────────────────${NC}"
     local total=${#MENU_NAMES[@]}
-    for (( i=0; i<total; i++ )); do
-        local num=$(( i + 1 ))
-        echo -e "  ${BOLD}${YELLOW}[$num]${NC} ${WHITE}${MENU_NAMES[$i]}${NC}"
-        echo -e "      ${DIM}${MENU_DESCS[$i]}${NC}"
+    local cols=3
+    local rows=$(( (total + cols - 1) / cols ))
+    local row col idx num
+
+    for (( row=0; row<rows; row++ )); do
+        echo -n "  "
+        for (( col=0; col<cols; col++ )); do
+            idx=$(( row + col * rows ))
+            if (( idx < total )); then
+                num=$(( idx + 1 ))
+                printf "${BOLD}${YELLOW}[%2d]${NC} ${WHITE}%-22s${NC}" "$num" "${MENU_NAMES[$idx]}"
+            fi
+        done
         echo ""
     done
-    echo -e "  ${BOLD}${RED}[0]${NC} ${DIM}Thoát${NC}"
-    echo -e "  ${CYAN}────────────────────────────────────────${NC}"
+    echo ""
+    echo -e "  ${BOLD}${RED}[ 0]${NC} ${DIM}Thoát${NC}"
+    echo -e "  ${CYAN}────────────────────────────────────────────────────────────────────────────${NC}"
     echo ""
     echo -ne "  ${BOLD}Chọn lệnh: ${NC}"
 }
@@ -833,7 +855,9 @@ main() {
     while true; do
         draw_header
         draw_menu
-        read -r choice
+        if ! read -r choice; then
+            echo -e "\n  ${DIM}Tạm biệt!${NC}\n"; exit 0
+        fi
 
         if [[ "$choice" == "0" || "$choice" == "q" || "$choice" == "Q" ]]; then
             echo -e "\n  ${DIM}Tạm biệt!${NC}\n"; exit 0
