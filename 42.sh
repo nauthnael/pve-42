@@ -488,16 +488,30 @@ cmd_check_network() {
         echo -e "  ${RED}✗ Không tìm thấy $LEASE_FILE${NC}\n"; return 1
     fi
 
-    echo -e "  ${DIM}Đang quét tất cả CT đang running...${NC}"
+    echo -e "  ${DIM}Kết hợp dãy và số lẻ (vd: ${WHITE}220-222,225,230-232${DIM}):${NC}"
+    echo -ne "  ${YELLOW}CT range/ID: ${NC}"
+    read -r input
+
+    if [[ -z "$input" ]]; then
+        echo -e "\n  ${DIM}Đã hủy.${NC}\n"; return
+    fi
+
+    local ct_list
+    ct_list=$(parse_ct_input "$input") || { echo ""; return 1; }
+    local ct_arr=($ct_list)
+
+    echo ""
+    echo -e "  ${DIM}Đang quét ${WHITE}${#ct_arr[@]} CT đã chọn${DIM}:${NC} ${ct_list}"
     echo ""
 
-    local lost=() ok=0 total=0
+    local lost=() ok=0 total=0 skipped=0
 
-    while IFS= read -r line; do
-        local ctid
-        ctid=$(echo "$line" | awk '{print $1}')
-        [[ ! "$ctid" =~ ^[0-9]+$ ]] && continue
-        pct status "$ctid" 2>/dev/null | grep -q "running" || continue
+    for ctid in "${ct_arr[@]}"; do
+        if ! pct status "$ctid" 2>/dev/null | grep -q "running"; then
+            echo -e "  ${DIM}[skip] CT $ctid không running hoặc không tồn tại${NC}"
+            (( skipped++ ))
+            continue
+        fi
         (( total++ ))
 
         local mac
@@ -520,12 +534,13 @@ cmd_check_network() {
         else
             (( ok++ ))
         fi
-    done < <(pct list 2>/dev/null | tail -n +2)
+    done
 
     echo ""
     echo -e "${DIM}  ─────────────────────────────────────${NC}"
-    local summary="  ${DIM}Tổng: ${WHITE}$total CT running${NC} — ${GREEN}$ok OK${NC}"
+    local summary="  ${DIM}Tổng: ${WHITE}$total CT running đã chọn${NC} — ${GREEN}$ok OK${NC}"
     [[ ${#lost[@]} -gt 0 ]] && summary+=", ${RED}${#lost[@]} mất IP${NC}"
+    [[ $skipped -gt 0 ]] && summary+=", ${DIM}${skipped} bỏ qua${NC}"
     echo -e "$summary"
     echo ""
 
