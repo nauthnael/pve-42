@@ -565,7 +565,9 @@ cmd_check_network() {
 
     local lost_list="${lost[*]}"
     local stats
-    stats=$(run_parallel "$threads" "$lost_list" "_worker_renew_dhcp")
+    stats=$(run_parallel "$threads" "$lost_list" "_worker_renew_dhcp" "$LEASE_FILE")
+    echo "$stats" | sed '/^__STATS__/d'
+
     local r_ok r_fail
     r_ok=$(echo   "$stats" | grep -oP 'ok=\K[0-9]+')
     r_fail=$(echo "$stats" | grep -oP 'failed=\K[0-9]+')
@@ -578,16 +580,44 @@ cmd_check_network() {
 }
 
 _worker_renew_dhcp() {
-    local ctid="$1" tmpdir="$2"
+    local ctid="$1" tmpdir="$2" lease_file="$3"
     echo -ne "  CT $ctid ... "
+
+    local method=""
     if pct exec "$ctid" -- networkctl renew eth0 2>/dev/null; then
-        echo -e "${GREEN}✓ networkctl renew OK${NC}"
-        echo "ok" > "$tmpdir/${ctid}.status"
+        method="networkctl renew"
     elif pct exec "$ctid" -- dhcpcd eth0 2>/dev/null; then
-        echo -e "${GREEN}✓ dhcpcd OK${NC}"
-        echo "ok" > "$tmpdir/${ctid}.status"
+        method="dhcpcd"
     else
         echo -e "${RED}✗ thất bại${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    local mac new_ip attempt
+    mac=$(pct config "$ctid" 2>/dev/null \
+        | grep -E '^net[0-9]+:' \
+        | grep -oP 'hwaddr=\K[0-9A-Fa-f:]+' \
+        | head -1 | tr '[:upper:]' '[:lower:]')
+
+    for attempt in $(seq 1 10); do
+        if [[ -n "$mac" && -f "$lease_file" ]]; then
+            new_ip=$(grep -i "$mac" "$lease_file" | awk '{print $3}' | tail -1)
+        fi
+        [[ -n "$new_ip" ]] && break
+
+        new_ip=$(pct exec "$ctid" -- bash -c \
+            "ip -4 -o addr show dev eth0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1" 2>/dev/null)
+        [[ -n "$new_ip" ]] && break
+
+        sleep 1
+    done
+
+    if [[ -n "$new_ip" ]]; then
+        echo -e "${GREEN}✓ ${method} OK${NC} ${DIM}→ IP mới:${NC} ${WHITE}${new_ip}${NC}"
+        echo "ok" > "$tmpdir/${ctid}.status"
+    else
+        echo -e "${YELLOW}⚠ ${method} OK nhưng chưa đọc được IP mới${NC}"
         echo "fail" > "$tmpdir/${ctid}.status"
     fi
 }
