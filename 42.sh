@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.5"
+APP_VERSION="1.6"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -469,10 +469,36 @@ _worker_deploy_aro() {
         return
     fi
 
-    if ! pct status "$ctid" 2>/dev/null | grep -q "running"; then
-        echo -e "  ${DIM}[CT ${ctid}] không running, bỏ qua${NC}"
-        echo "skip" > "$tmpdir/${ctid}.status"
+    local status start_output wait_count
+    status=$(pct status "$ctid" 2>/dev/null)
+    if [[ -z "$status" ]]; then
+        echo -e "  ${RED}[CT ${ctid}] không tồn tại${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
         return
+    fi
+
+    if ! echo "$status" | grep -q "running"; then
+        echo -e "  ${YELLOW}[CT ${ctid}] đang off, bật CT trước khi deploy...${NC}"
+        if ! start_output=$(pct start "$ctid" 2>&1); then
+            [[ -n "$start_output" ]] && echo "$start_output" | sed "s/^/  [CT ${ctid}] /"
+            echo -e "  ${RED}[CT ${ctid}] ✗ Không bật được CT${NC}"
+            echo "fail" > "$tmpdir/${ctid}.status"
+            return
+        fi
+
+        for wait_count in $(seq 1 30); do
+            if pct status "$ctid" 2>/dev/null | grep -q "running"; then
+                echo -e "  ${GREEN}[CT ${ctid}] ✓ CT đã running${NC}"
+                break
+            fi
+            sleep 2
+        done
+
+        if ! pct status "$ctid" 2>/dev/null | grep -q "running"; then
+            echo -e "  ${RED}[CT ${ctid}] ✗ CT chưa running sau 60 giây${NC}"
+            echo "fail" > "$tmpdir/${ctid}.status"
+            return
+        fi
     fi
 
     echo -e "  ${CYAN}[CT ${ctid}] Đang tải aro-manager.sh...${NC}"
