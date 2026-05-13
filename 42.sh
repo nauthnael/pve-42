@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.4"
+APP_VERSION="1.5"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -36,6 +36,7 @@ MENU_NAMES+=("Check Network CT");   MENU_DESCS+=("Kiểm tra CT mất IP, tùy c
 MENU_NAMES+=("Check ARO Score");    MENU_DESCS+=("Kiểm tra điểm ARO node, tùy chọn xuất CSV");                   MENU_FUNCS+=("cmd_check_score")
 MENU_NAMES+=("Kết nối Dashboard");  MENU_DESCS+=("Enable ARO dashboard URL/API cho các CT đã chọn");             MENU_FUNCS+=("cmd_connect_dashboard")
 MENU_NAMES+=("Deploy ARO");         MENU_DESCS+=("Deploy ARO theo proxy từ /root/ct-list.csv");                  MENU_FUNCS+=("cmd_deploy_aro")
+MENU_NAMES+=("Shrink CT Disk");     MENU_DESCS+=("Shrink root disk LVM/ext4 của CT về dung lượng chọn");          MENU_FUNCS+=("cmd_shrink_ct_disk")
 
 # ── Thêm lệnh mới bên dưới ──
 # MENU_NAMES+=("Tên lệnh"); MENU_DESCS+=("Mô tả"); MENU_FUNCS+=("cmd_ten_lenh")
@@ -518,6 +519,103 @@ _worker_deploy_aro() {
     fi
 }
 
+_worker_shrink_ct_disk() {
+    local ctid="$1" tmpdir="$2" target_gb="$3"
+    local fs_mb=$(( target_gb * 950 ))
+
+    _shrink_run_step() {
+        local label="$1"; shift
+        local output
+        echo -e "  ${CYAN}[CT ${ctid}] ${label}...${NC}"
+        if output=$("$@" 2>&1); then
+            [[ -n "$output" ]] && echo "$output" | sed "s/^/  [CT ${ctid}] /"
+            echo -e "  ${GREEN}[CT ${ctid}] ✓ ${label}${NC}"
+            return 0
+        fi
+
+        [[ -n "$output" ]] && echo "$output" | sed "s/^/  [CT ${ctid}] /"
+        echo -e "  ${RED}[CT ${ctid}] ✗ ${label}${NC}"
+        return 1
+    }
+
+    local status rootfs vol current_size storage volname lv_ref dev_path conf_file
+
+    status=$(pct status "$ctid" 2>/dev/null)
+    if [[ -z "$status" ]]; then
+        echo -e "  ${RED}[CT ${ctid}] không tồn tại${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    rootfs=$(pct config "$ctid" 2>/dev/null | awk '/^rootfs:/ {print; exit}')
+    if [[ -z "$rootfs" ]]; then
+        echo -e "  ${RED}[CT ${ctid}] không đọc được rootfs trong config${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    vol=$(echo "$rootfs" | awk '{print $2}' | cut -d',' -f1)
+    current_size=$(echo "$rootfs" | grep -oP 'size=\K[^,]+' | head -1)
+    if [[ "$vol" != *:* ]]; then
+        echo -e "  ${RED}[CT ${ctid}] rootfs không phải volume dạng storage:volume: ${vol}${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    storage="${vol%%:*}"
+    volname="${vol#*:}"
+    lv_ref="${storage}/${volname}"
+
+    echo -e "  ${DIM}[CT ${ctid}] Rootfs: ${vol} ${current_size:+(size hiện tại: ${current_size})}${NC}"
+    echo -e "  ${DIM}[CT ${ctid}] Target: ${target_gb}G, resize2fs trước lvreduce: ${fs_mb}M${NC}"
+
+    if [[ "$current_size" =~ ^([0-9]+)[gG]$ ]] && (( target_gb >= BASH_REMATCH[1] )); then
+        echo -e "  ${YELLOW}[CT ${ctid}] target ${target_gb}G không nhỏ hơn size hiện tại ${current_size}, bỏ qua${NC}"
+        echo "skip" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    if echo "$status" | grep -q "running"; then
+        _shrink_run_step "Stop CT" pct stop "$ctid" || { echo "fail" > "$tmpdir/${ctid}.status"; return; }
+    else
+        echo -e "  ${DIM}[CT ${ctid}] CT đang stopped, không cần stop${NC}"
+    fi
+
+    _shrink_run_step "Activate volume ${lv_ref}" lvchange -ay "$lv_ref" || { echo "fail" > "$tmpdir/${ctid}.status"; return; }
+
+    dev_path=$(lvs --noheadings -o lv_path "$lv_ref" 2>/dev/null | awk '{print $1}' | head -1)
+    [[ -z "$dev_path" ]] && dev_path="/dev/${storage}/${volname}"
+
+    if [[ ! -e "$dev_path" ]]; then
+        echo -e "  ${RED}[CT ${ctid}] không tìm thấy block device: ${dev_path}${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    _shrink_run_step "Check filesystem" e2fsck -f -y "$dev_path" || { echo "fail" > "$tmpdir/${ctid}.status"; return; }
+    _shrink_run_step "Shrink filesystem xuống ${fs_mb}M" resize2fs "$dev_path" "${fs_mb}M" || { echo "fail" > "$tmpdir/${ctid}.status"; return; }
+    _shrink_run_step "Shrink LVM volume xuống ${target_gb}G" lvreduce -y -L "${target_gb}G" "$dev_path" || { echo "fail" > "$tmpdir/${ctid}.status"; return; }
+    _shrink_run_step "Expand filesystem fill hết volume" resize2fs "$dev_path" || { echo "fail" > "$tmpdir/${ctid}.status"; return; }
+
+    conf_file="/etc/pve/lxc/${ctid}.conf"
+    if [[ ! -f "$conf_file" ]]; then
+        echo -e "  ${RED}[CT ${ctid}] không tìm thấy config: ${conf_file}${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    if grep -q '^rootfs:.*size=' "$conf_file"; then
+        _shrink_run_step "Cập nhật config size=${target_gb}G" sed -i -E "/^rootfs:/ s/size=[^,]+/size=${target_gb}G/" "$conf_file" || { echo "fail" > "$tmpdir/${ctid}.status"; return; }
+    else
+        echo -e "  ${RED}[CT ${ctid}] rootfs config không có trường size= để cập nhật${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    echo -e "  ${GREEN}[CT ${ctid}] ✓ Shrink hoàn tất. CT đang stopped, hãy start lại khi cần.${NC}"
+    echo "ok" > "$tmpdir/${ctid}.status"
+}
+
 _worker_ct_power() {
     local ctid="$1" tmpdir="$2" action="$3" color="$4"
 
@@ -647,6 +745,107 @@ cmd_aro_update_watchdog() { _prompt_and_run "Aro Update Watchdog" "CYAN" "_worke
 cmd_ct_restart()  { _prompt_and_run "CT Restart"  "GREEN"   "_worker_ct_power" "restart" "GREEN";  }
 cmd_ct_stop()     { _prompt_and_run "CT Stop"     "RED"     "_worker_ct_power" "stop"   "RED";     }
 cmd_connect_dashboard() { _prompt_and_run "Kết nối Dashboard" "CYAN" "_worker_connect_dashboard";  }
+
+cmd_shrink_ct_disk() {
+    echo ""
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${WHITE}  Shrink CT Disk${NC}"
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+    echo -e "  ${RED}${BOLD}CẢNH BÁO:${NC} thao tác này sẽ stop CT nếu đang running và shrink root disk LVM/ext4."
+    echo -e "  ${YELLOW}Chỉ chạy khi bạn đã backup/snapshot và chắc chắn dữ liệu dùng ít hơn dung lượng target.${NC}"
+    echo -e "  ${DIM}Sau khi shrink xong CT sẽ vẫn ở trạng thái stopped.${NC}"
+    echo ""
+
+    echo -e "  ${DIM}Kết hợp dãy và số lẻ (vd: ${WHITE}850-852,860${DIM}):${NC}"
+    echo -ne "  ${YELLOW}CT range/ID: ${NC}"
+    read -r input
+
+    if [[ -z "$input" ]]; then
+        echo -e "\n  ${DIM}Đã hủy.${NC}\n"; return
+    fi
+
+    local ct_list
+    ct_list=$(parse_ct_input "$input") || { echo ""; return 1; }
+    local ct_arr=($ct_list)
+
+    echo -ne "  ${YELLOW}Shrink về bao nhiêu GB? (Enter = 8): ${NC}"
+    read -r size_input
+    size_input="${size_input//[gG][bB]/}"
+    size_input="${size_input//[gG]/}"
+    size_input="${size_input// /}"
+
+    local target_gb
+    if [[ -z "$size_input" ]]; then
+        target_gb=8
+    elif [[ "$size_input" =~ ^[0-9]+$ ]] && (( size_input >= 1 )); then
+        target_gb="$size_input"
+    else
+        echo -e "  ${DIM}Dung lượng không hợp lệ, dùng mặc định 8G.${NC}"
+        target_gb=8
+    fi
+
+    echo ""
+    echo -e "  ${DIM}Sẽ shrink ${WHITE}${#ct_arr[@]} CT${DIM}:${NC} ${ct_list}"
+    echo -e "  ${DIM}Target size:${NC} ${WHITE}${target_gb}G${NC}"
+    echo ""
+    echo -ne "  ${RED}Gõ YES để xác nhận stop và shrink disk các CT trên: ${NC}"
+    read -r confirm
+    if [[ "$confirm" != "YES" ]]; then
+        echo -e "\n  ${DIM}Đã hủy.${NC}\n"; return
+    fi
+
+    local threads
+    threads=$(ask_threads 1)
+
+    local run_list="$ct_list"
+    local attempt=1
+
+    while true; do
+        echo ""
+        if (( attempt == 1 )); then
+            echo -e "  ${GREEN}▶ Bắt đầu shrink với ${threads} luồng...${NC}"
+        else
+            echo -e "  ${YELLOW}↻ Chạy lại shrink lần ${attempt} với ${threads} luồng...${NC}"
+        fi
+        echo -e "${DIM}  ─────────────────────────────────────${NC}"
+        echo ""
+
+        local stats stats_file
+        stats_file=$(mktemp /tmp/42_shrink_stats_XXXXXX)
+        RUN_PARALLEL_STATS_FILE="$stats_file" run_parallel "$threads" "$run_list" "_worker_shrink_ct_disk" "$target_gb"
+        stats=$(cat "$stats_file")
+        rm -f "$stats_file"
+
+        local ok skipped failed failed_list
+        ok=$(echo    "$stats" | grep -oP 'ok=\K[0-9]+')
+        skipped=$(echo "$stats" | grep -oP 'skipped=\K[0-9]+')
+        failed=$(echo  "$stats" | grep -oP 'failed=\K[0-9]+')
+        failed_list=$(echo "$stats" | sed -n 's/^__FAILED__ //p' | head -1)
+
+        echo -e "${DIM}  ─────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}Thành công:${NC} ${WHITE}${ok} CT${NC}"
+        echo -e "  ${RED}Thất bại:${NC}   ${WHITE}${failed} CT${NC}"
+        echo -e "  ${YELLOW}Bỏ qua:${NC}     ${WHITE}${skipped} CT${NC}"
+
+        if [[ "$failed" -gt 0 && -n "$failed_list" ]]; then
+            echo ""
+            echo -e "  ${RED}CT thất bại:${NC} ${WHITE}${failed_list}${NC}"
+            echo -e "  ${DIM}Copy list:${NC} ${failed_list}"
+            echo ""
+            echo -ne "  ${YELLOW}Chạy lại các CT thất bại? (y/N): ${NC}"
+            read -r retry_confirm
+            if [[ "$retry_confirm" =~ ^[yY]$ ]]; then
+                run_list="$failed_list"
+                (( attempt++ ))
+                continue
+            fi
+        fi
+
+        echo ""
+        break
+    done
+}
 
 cmd_deploy_aro() {
     local csv_file="/root/ct-list.csv"
