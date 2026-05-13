@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.3"
+APP_VERSION="1.4"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -35,6 +35,7 @@ MENU_NAMES+=("Open VNC");           MENU_DESCS+=("Thêm iptables forward VNC cho
 MENU_NAMES+=("Check Network CT");   MENU_DESCS+=("Kiểm tra CT mất IP, tùy chọn renew DHCP tự động");             MENU_FUNCS+=("cmd_check_network")
 MENU_NAMES+=("Check ARO Score");    MENU_DESCS+=("Kiểm tra điểm ARO node, tùy chọn xuất CSV");                   MENU_FUNCS+=("cmd_check_score")
 MENU_NAMES+=("Kết nối Dashboard");  MENU_DESCS+=("Enable ARO dashboard URL/API cho các CT đã chọn");             MENU_FUNCS+=("cmd_connect_dashboard")
+MENU_NAMES+=("Deploy ARO");         MENU_DESCS+=("Deploy ARO theo proxy từ /root/ct-list.csv");                  MENU_FUNCS+=("cmd_deploy_aro")
 
 # ── Thêm lệnh mới bên dưới ──
 # MENU_NAMES+=("Tên lệnh"); MENU_DESCS+=("Mô tả"); MENU_FUNCS+=("cmd_ten_lenh")
@@ -75,7 +76,7 @@ parse_ct_input() {
 #  Trả về số luồng qua stdout
 # ─────────────────────────────────────────────
 ask_threads() {
-    local default=4
+    local default="${1:-4}"
     echo -ne "  ${YELLOW}Số luồng song song (Enter = ${default}): ${NC}" >&2
     read -r t
     t="${t// /}"
@@ -338,6 +339,185 @@ _worker_connect_dashboard() {
     fi
 }
 
+_shell_quote() {
+    printf "%q" "$1"
+}
+
+_deploy_config_path() {
+    echo "${HOME:-/root}/deploy-aro.conf"
+}
+
+prompt_deploy_config() {
+    local config_file="$1"
+    local ssh_key vnc_pass bot_token chat_id script_url min_size
+
+    echo ""
+    echo -e "  ${YELLOW}Chưa có file cấu hình deploy:${NC} ${WHITE}${config_file}${NC}"
+    echo -e "  ${DIM}Thông tin nhạy cảm sẽ lưu local với quyền 600, không commit lên Git.${NC}"
+    echo ""
+
+    echo -ne "  ${YELLOW}SSH key: ${NC}"
+    read -r ssh_key
+    echo -ne "  ${YELLOW}VNC password: ${NC}"
+    read -rs vnc_pass
+    echo ""
+    echo -ne "  ${YELLOW}Bot token: ${NC}"
+    read -rs bot_token
+    echo ""
+    echo -ne "  ${YELLOW}Chat ID: ${NC}"
+    read -r chat_id
+    echo -ne "  ${YELLOW}ARO script URL (Enter = GitHub mặc định): ${NC}"
+    read -r script_url
+    echo -ne "  ${YELLOW}Dung lượng script tối thiểu byte (Enter = 10240): ${NC}"
+    read -r min_size
+
+    [[ -z "$script_url" ]] && script_url="https://raw.githubusercontent.com/nauthnael/aro-manager/main/aro-manager.sh"
+    [[ -z "$min_size" || ! "$min_size" =~ ^[0-9]+$ ]] && min_size=10240
+
+    if [[ -z "$ssh_key" || -z "$vnc_pass" || -z "$bot_token" || -z "$chat_id" ]]; then
+        echo -e "  ${RED}✗ Thiếu thông tin bắt buộc, hủy tạo config.${NC}"
+        return 1
+    fi
+
+    umask 077
+    {
+        printf "SSH_KEY=%q\n" "$ssh_key"
+        printf "VNC_PASS=%q\n" "$vnc_pass"
+        printf "BOT_TOKEN=%q\n" "$bot_token"
+        printf "CHAT_ID=%q\n" "$chat_id"
+        printf "ARO_SCRIPT_URL=%q\n" "$script_url"
+        printf "MIN_SCRIPT_SIZE=%q\n" "$min_size"
+    } > "$config_file"
+    chmod 600 "$config_file"
+
+    echo -e "  ${GREEN}✓ Đã tạo config:${NC} ${WHITE}${config_file}${NC}"
+}
+
+load_deploy_config() {
+    local config_file
+    config_file=$(_deploy_config_path)
+
+    if [[ ! -f "$config_file" ]]; then
+        prompt_deploy_config "$config_file" || return 1
+    fi
+
+    chmod 600 "$config_file" 2>/dev/null
+    # shellcheck disable=SC1090
+    source "$config_file"
+
+    ARO_SCRIPT_URL="${ARO_SCRIPT_URL:-https://raw.githubusercontent.com/nauthnael/aro-manager/main/aro-manager.sh}"
+    MIN_SCRIPT_SIZE="${MIN_SCRIPT_SIZE:-10240}"
+
+    if [[ -z "${SSH_KEY:-}" || -z "${VNC_PASS:-}" || -z "${BOT_TOKEN:-}" || -z "${CHAT_ID:-}" ]]; then
+        echo -e "  ${RED}✗ Config thiếu SSH_KEY/VNC_PASS/BOT_TOKEN/CHAT_ID.${NC}"
+        echo -e "  ${DIM}Sửa file ${WHITE}${config_file}${DIM} hoặc xóa file để nhập lại.${NC}"
+        return 1
+    fi
+
+    if ! [[ "$MIN_SCRIPT_SIZE" =~ ^[0-9]+$ ]]; then
+        echo -e "  ${YELLOW}⚠ MIN_SCRIPT_SIZE không hợp lệ, dùng 10240.${NC}"
+        MIN_SCRIPT_SIZE=10240
+    fi
+}
+
+show_deploy_csv_cts() {
+    local csv_file="$1"
+    echo -e "${CYAN}=== Danh sách CT trong CSV ===${NC}"
+    awk -F',' '
+        /^[0-9]/ {
+            gsub(/\r/, "", $1)
+            ids[++n]=$1
+        }
+        END {
+            for (i=1; i<=n; i++) {
+                if (i % 10 == 1) printf "\n  "
+                printf "%-6s", ids[i]
+            }
+            print "\n"
+        }
+    ' "$csv_file"
+}
+
+_get_deploy_proxy() {
+    local ctid="$1" csv_file="$2"
+    awk -F',' -v id="$ctid" '
+        /^[0-9]/ {
+            gsub(/\r/, "", $1)
+            gsub(/\r/, "", $2)
+            if ($1 == id) {
+                print $2
+                exit
+            }
+        }
+    ' "$csv_file"
+}
+
+_worker_deploy_aro() {
+    local ctid="$1" tmpdir="$2" csv_file="$3" config_file="$4"
+
+    # shellcheck disable=SC1090
+    source "$config_file"
+    ARO_SCRIPT_URL="${ARO_SCRIPT_URL:-https://raw.githubusercontent.com/nauthnael/aro-manager/main/aro-manager.sh}"
+    MIN_SCRIPT_SIZE="${MIN_SCRIPT_SIZE:-10240}"
+
+    local proxy
+    proxy=$(_get_deploy_proxy "$ctid" "$csv_file")
+    if [[ -z "$proxy" ]]; then
+        echo -e "  ${RED}[CT ${ctid}] không tìm thấy proxy trong CSV${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    if ! pct status "$ctid" 2>/dev/null | grep -q "running"; then
+        echo -e "  ${DIM}[CT ${ctid}] không running, bỏ qua${NC}"
+        echo "skip" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    echo -e "  ${CYAN}[CT ${ctid}] Đang tải aro-manager.sh...${NC}"
+
+    local download_output size
+    if ! download_output=$(pct exec "$ctid" -- bash -c \
+        "wget -4 --no-cache -q -O /root/aro-manager.sh '$ARO_SCRIPT_URL'" 2>&1); then
+        [[ -n "$download_output" ]] && echo "$download_output" | sed "s/^/  [CT ${ctid}] /"
+        echo -e "  ${RED}[CT ${ctid}] ✗ Tải aro-manager.sh thất bại${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    size=$(pct exec "$ctid" -- bash -c "stat -c%s /root/aro-manager.sh 2>/dev/null || echo 0")
+    size="${size//[!0-9]/}"
+    [[ -z "$size" ]] && size=0
+
+    if (( size < MIN_SCRIPT_SIZE )); then
+        echo -e "  ${RED}[CT ${ctid}] ✗ File tải về quá nhỏ: ${size} bytes (< ${MIN_SCRIPT_SIZE})${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    echo -e "  ${GREEN}[CT ${ctid}] ✓ Tải OK (${size} bytes)${NC}"
+    echo -e "  ${CYAN}[CT ${ctid}] Đang deploy...${NC}"
+
+    local q_proxy q_ssh q_vnc q_token q_chat deploy_cmd deploy_output
+    q_proxy=$(_shell_quote "$proxy")
+    q_ssh=$(_shell_quote "$SSH_KEY")
+    q_vnc=$(_shell_quote "$VNC_PASS")
+    q_token=$(_shell_quote "$BOT_TOKEN")
+    q_chat=$(_shell_quote "$CHAT_ID")
+
+    deploy_cmd="chmod +x /root/aro-manager.sh && yes 2>/dev/null | bash /root/aro-manager.sh deploy ${q_proxy} --ssh-key ${q_ssh} --vnc-pass ${q_vnc} --token ${q_token} --chatid ${q_chat}; exit \${PIPESTATUS[1]}"
+
+    if deploy_output=$(pct exec "$ctid" -- bash -c "$deploy_cmd" 2>&1); then
+        [[ -n "$deploy_output" ]] && echo "$deploy_output" | sed "s/^/  [CT ${ctid}] /"
+        echo -e "  ${GREEN}[CT ${ctid}] ✓ Deploy thành công${NC}"
+        echo "ok" > "$tmpdir/${ctid}.status"
+    else
+        [[ -n "$deploy_output" ]] && echo "$deploy_output" | sed "s/^/  [CT ${ctid}] /"
+        echo -e "  ${RED}[CT ${ctid}] ✗ Deploy thất bại${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+    fi
+}
+
 _worker_ct_power() {
     local ctid="$1" tmpdir="$2" action="$3" color="$4"
 
@@ -467,6 +647,118 @@ cmd_aro_update_watchdog() { _prompt_and_run "Aro Update Watchdog" "CYAN" "_worke
 cmd_ct_restart()  { _prompt_and_run "CT Restart"  "GREEN"   "_worker_ct_power" "restart" "GREEN";  }
 cmd_ct_stop()     { _prompt_and_run "CT Stop"     "RED"     "_worker_ct_power" "stop"   "RED";     }
 cmd_connect_dashboard() { _prompt_and_run "Kết nối Dashboard" "CYAN" "_worker_connect_dashboard";  }
+
+cmd_deploy_aro() {
+    local csv_file="/root/ct-list.csv"
+    local config_file
+    config_file=$(_deploy_config_path)
+
+    echo ""
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${BOLD}${WHITE}  Deploy ARO${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    load_deploy_config || { echo ""; return 1; }
+
+    if [[ ! -f "$csv_file" ]]; then
+        echo -e "  ${RED}✗ Không tìm thấy CSV:${NC} ${WHITE}${csv_file}${NC}"
+        echo -e "  ${DIM}CSV cần dạng: ctid,proxy${NC}"
+        echo ""
+        return 1
+    fi
+
+    show_deploy_csv_cts "$csv_file"
+
+    echo -e "  ${DIM}Kết hợp dãy và số lẻ (vd: ${WHITE}882-883,890${DIM}):${NC}"
+    echo -ne "  ${YELLOW}CT range/ID: ${NC}"
+    read -r input
+
+    if [[ -z "$input" ]]; then
+        echo -e "\n  ${DIM}Đã hủy.${NC}\n"; return
+    fi
+
+    local ct_list
+    ct_list=$(parse_ct_input "$input") || { echo ""; return 1; }
+
+    local deploy_list="" missing=()
+    local ctid proxy
+    for ctid in $ct_list; do
+        proxy=$(_get_deploy_proxy "$ctid" "$csv_file")
+        if [[ -z "$proxy" ]]; then
+            missing+=("$ctid")
+        else
+            deploy_list+="$ctid "
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        echo -e "  ${YELLOW}⚠ Không có proxy trong CSV, bỏ qua:${NC} ${missing[*]}"
+    fi
+
+    if [[ -z "$deploy_list" ]]; then
+        echo -e "  ${RED}✗ Không có CT hợp lệ để deploy.${NC}"
+        echo ""
+        return 1
+    fi
+
+    local deploy_arr=($deploy_list)
+    echo ""
+    echo -e "  ${DIM}Sẽ deploy ${WHITE}${#deploy_arr[@]} CT${DIM}:${NC} ${deploy_list}"
+
+    local threads
+    threads=$(ask_threads 1)
+
+    local run_list="$deploy_list"
+    local attempt=1
+
+    while true; do
+        echo ""
+        if (( attempt == 1 )); then
+            echo -e "  ${GREEN}▶ Bắt đầu deploy với ${threads} luồng...${NC}"
+        else
+            echo -e "  ${YELLOW}↻ Chạy lại deploy lần ${attempt} với ${threads} luồng...${NC}"
+        fi
+        echo -e "${DIM}  ─────────────────────────────────────${NC}"
+        echo ""
+
+        local stats stats_file
+        stats_file=$(mktemp /tmp/42_deploy_stats_XXXXXX)
+        RUN_PARALLEL_STATS_FILE="$stats_file" run_parallel "$threads" "$run_list" "_worker_deploy_aro" "$csv_file" "$config_file"
+        stats=$(cat "$stats_file")
+        rm -f "$stats_file"
+
+        local ok skipped failed failed_list
+        ok=$(echo    "$stats" | grep -oP 'ok=\K[0-9]+')
+        skipped=$(echo "$stats" | grep -oP 'skipped=\K[0-9]+')
+        failed=$(echo  "$stats" | grep -oP 'failed=\K[0-9]+')
+        failed_list=$(echo "$stats" | sed -n 's/^__FAILED__ //p' | head -1)
+
+        echo -e "${DIM}  ─────────────────────────────────────${NC}"
+        echo -e "  ${GREEN}Thành công:${NC} ${WHITE}${ok} CT${NC}"
+        echo -e "  ${RED}Thất bại:${NC}   ${WHITE}${failed} CT${NC}"
+        echo -e "  ${YELLOW}Bỏ qua:${NC}     ${WHITE}${skipped} CT${NC}"
+
+        if [[ "$failed" -gt 0 && -n "$failed_list" ]]; then
+            echo ""
+            echo -e "  ${RED}CT thất bại:${NC} ${WHITE}${failed_list}${NC}"
+            echo -e "  ${DIM}Copy list:${NC} ${failed_list}"
+            echo ""
+            echo -ne "  ${YELLOW}Chạy lại các CT thất bại? (y/N): ${NC}"
+            read -r retry_confirm
+            if [[ "$retry_confirm" =~ ^[yY]$ ]]; then
+                run_list="$failed_list"
+                (( attempt++ ))
+                continue
+            fi
+        fi
+
+        echo ""
+        echo -e "${CYAN}=== All done ===${NC}"
+        echo ""
+        break
+    done
+}
 
 # ── Open VNC (không dùng parallel vì mỗi CT cần logic riêng với iptables) ──
 cmd_open_vnc() {
