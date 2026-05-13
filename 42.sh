@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.6"
+APP_VERSION="1.7"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -453,6 +453,30 @@ _get_deploy_proxy() {
     ' "$csv_file"
 }
 
+_wait_ct_network() {
+    local ctid="$1" timeout="${2:-90}"
+    local test_url="${3:-https://raw.githubusercontent.com/}"
+    local elapsed=0 ip=""
+
+    while (( elapsed < timeout )); do
+        ip=$(pct exec "$ctid" -- bash -c \
+            "ip -4 -o addr show dev eth0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -1" 2>/dev/null)
+
+        if [[ -n "$ip" ]] \
+            && pct exec "$ctid" -- bash -c "ip route 2>/dev/null | grep -q '^default '" \
+            && pct exec "$ctid" -- bash -c "wget -4 -q --spider --timeout=5 --tries=1 '$test_url'" 2>/dev/null; then
+            echo "$ip"
+            return 0
+        fi
+
+        sleep 3
+        (( elapsed += 3 ))
+    done
+
+    [[ -n "$ip" ]] && echo "$ip"
+    return 1
+}
+
 _worker_deploy_aro() {
     local ctid="$1" tmpdir="$2" csv_file="$3" config_file="$4"
 
@@ -469,7 +493,7 @@ _worker_deploy_aro() {
         return
     fi
 
-    local status start_output wait_count
+    local status start_output wait_count ct_ip
     status=$(pct status "$ctid" 2>/dev/null)
     if [[ -z "$status" ]]; then
         echo -e "  ${RED}[CT ${ctid}] không tồn tại${NC}"
@@ -501,23 +525,44 @@ _worker_deploy_aro() {
         fi
     fi
 
-    echo -e "  ${CYAN}[CT ${ctid}] Đang tải aro-manager.sh...${NC}"
-
-    local download_output size
-    if ! download_output=$(pct exec "$ctid" -- bash -c \
-        "wget -4 --no-cache -q -O /root/aro-manager.sh '$ARO_SCRIPT_URL'" 2>&1); then
-        [[ -n "$download_output" ]] && echo "$download_output" | sed "s/^/  [CT ${ctid}] /"
-        echo -e "  ${RED}[CT ${ctid}] ✗ Tải aro-manager.sh thất bại${NC}"
+    echo -e "  ${CYAN}[CT ${ctid}] Chờ network sẵn sàng...${NC}"
+    if ct_ip=$(_wait_ct_network "$ctid" 90 "$ARO_SCRIPT_URL"); then
+        echo -e "  ${GREEN}[CT ${ctid}] ✓ Network OK${NC} ${DIM}(IP: ${ct_ip})${NC}"
+    else
+        if [[ -n "$ct_ip" ]]; then
+            echo -e "  ${RED}[CT ${ctid}] ✗ Network chưa sẵn sàng sau 90 giây${NC} ${DIM}(IP: ${ct_ip}, chưa truy cập được raw.githubusercontent.com)${NC}"
+        else
+            echo -e "  ${RED}[CT ${ctid}] ✗ Network chưa sẵn sàng sau 90 giây${NC} ${DIM}(chưa có IPv4 trên eth0)${NC}"
+        fi
         echo "fail" > "$tmpdir/${ctid}.status"
         return
     fi
 
-    size=$(pct exec "$ctid" -- bash -c "stat -c%s /root/aro-manager.sh 2>/dev/null || echo 0")
-    size="${size//[!0-9]/}"
-    [[ -z "$size" ]] && size=0
+    echo -e "  ${CYAN}[CT ${ctid}] Đang tải aro-manager.sh...${NC}"
 
-    if (( size < MIN_SCRIPT_SIZE )); then
-        echo -e "  ${RED}[CT ${ctid}] ✗ File tải về quá nhỏ: ${size} bytes (< ${MIN_SCRIPT_SIZE})${NC}"
+    local download_output size download_ok=false attempt
+    for attempt in 1 2 3; do
+        echo -e "  ${DIM}[CT ${ctid}] Download attempt ${attempt}/3...${NC}"
+        download_output=$(pct exec "$ctid" -- bash -c \
+            "rm -f /root/aro-manager.sh && wget -4 --no-cache --timeout=30 --tries=1 -O /root/aro-manager.sh '$ARO_SCRIPT_URL'" 2>&1)
+        local wget_rc=$?
+        [[ -n "$download_output" ]] && echo "$download_output" | sed "s/^/  [CT ${ctid}] /"
+
+        size=$(pct exec "$ctid" -- bash -c "stat -c%s /root/aro-manager.sh 2>/dev/null || echo 0")
+        size="${size//[!0-9]/}"
+        [[ -z "$size" ]] && size=0
+
+        if (( wget_rc == 0 && size >= MIN_SCRIPT_SIZE )); then
+            download_ok=true
+            break
+        fi
+
+        echo -e "  ${YELLOW}[CT ${ctid}] Download chưa hợp lệ: rc=${wget_rc}, size=${size} bytes (< ${MIN_SCRIPT_SIZE})${NC}"
+        sleep 5
+    done
+
+    if [[ "$download_ok" != true ]]; then
+        echo -e "  ${RED}[CT ${ctid}] ✗ Tải aro-manager.sh thất bại sau 3 lần${NC}"
         echo "fail" > "$tmpdir/${ctid}.status"
         return
     fi
