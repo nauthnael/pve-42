@@ -17,12 +17,13 @@ Chạy lệnh này trên bất kỳ PVE nào — tự động cài mới hoặc 
 | 1 | Aro Report | Chạy `aro-manager.sh report` trên các CT đang running |
 | 2 | Aro Update | Tải & chạy `aro-manager.sh update` (có retry wget) |
 | 3 | Aro Restart | Chạy `aro-manager.sh restart` trên các CT đang running |
-| 4 | CT Start | Khởi động các CT (`pct start`) |
+| 4 | CT Restart | Restart CT đang chạy, CT đang off thì start |
 | 5 | CT Stop | Tắt các CT (`pct stop`) |
 | 6 | Aro Update Watchdog | Tải & chạy `aro-manager.sh update --watchdog-only` |
 | 7 | Open VNC | Thêm iptables forward VNC cho CT (tự xóa sau 2h) |
 | 8 | Check Network CT | Kiểm tra CT mất IP, tùy chọn renew DHCP |
 | 9 | Check ARO Score | Kiểm tra điểm ARO node, xuất CSV |
+| 10 | Kết nối Dashboard | Enable ARO dashboard URL/API cho các CT đã chọn |
 
 ## Quy trình cập nhật script
 

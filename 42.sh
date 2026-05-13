@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.2"
+APP_VERSION="1.3"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -34,6 +34,7 @@ MENU_NAMES+=("Aro Update Watchdog");MENU_DESCS+=("Tải & chạy aro-manager.sh 
 MENU_NAMES+=("Open VNC");           MENU_DESCS+=("Thêm iptables forward VNC cho CT (tự xóa sau 2h)");             MENU_FUNCS+=("cmd_open_vnc")
 MENU_NAMES+=("Check Network CT");   MENU_DESCS+=("Kiểm tra CT mất IP, tùy chọn renew DHCP tự động");             MENU_FUNCS+=("cmd_check_network")
 MENU_NAMES+=("Check ARO Score");    MENU_DESCS+=("Kiểm tra điểm ARO node, tùy chọn xuất CSV");                   MENU_FUNCS+=("cmd_check_score")
+MENU_NAMES+=("Kết nối Dashboard");  MENU_DESCS+=("Enable ARO dashboard URL/API cho các CT đã chọn");             MENU_FUNCS+=("cmd_connect_dashboard")
 
 # ── Thêm lệnh mới bên dưới ──
 # MENU_NAMES+=("Tên lệnh"); MENU_DESCS+=("Mô tả"); MENU_FUNCS+=("cmd_ten_lenh")
@@ -311,6 +312,32 @@ _worker_aro_watchdog() {
     echo "ok" > "$tmpdir/${ctid}.status"
 }
 
+_worker_connect_dashboard() {
+    local ctid="$1" tmpdir="$2"
+    local dashboard_url="https://as2dashboard.caphe.in"
+    local db_api="q7waBYOFXik+zJYJNA7cohTwAuTuangg"
+
+    if ! pct status "$ctid" 2>/dev/null | grep -q "running"; then
+        echo -e "  ${DIM}[CT ${ctid}] không running, bỏ qua${NC}"
+        echo "skip" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    echo -e "  ${CYAN}Enable Dashboard for CT ${ctid}...${NC}"
+
+    local cmd_output
+    if cmd_output=$(pct exec "$ctid" -- bash -c \
+        "cd /root && ./aro-manager.sh dashboard --enable=1 --url='${dashboard_url}' --db-api=${db_api}" 2>&1); then
+        [[ -n "$cmd_output" ]] && echo "$cmd_output" | sed "s/^/  [CT ${ctid}] /"
+        echo -e "  ${GREEN}[CT ${ctid}] ✓ Dashboard connected${NC}"
+        echo "ok" > "$tmpdir/${ctid}.status"
+    else
+        [[ -n "$cmd_output" ]] && echo "$cmd_output" | sed "s/^/  [CT ${ctid}] /"
+        echo -e "  ${RED}[CT ${ctid}] ✗ Dashboard connect failed${NC}"
+        echo "fail" > "$tmpdir/${ctid}.status"
+    fi
+}
+
 _worker_ct_power() {
     local ctid="$1" tmpdir="$2" action="$3" color="$4"
 
@@ -439,6 +466,7 @@ cmd_aro_update()  { _prompt_and_run "Aro Update"  "YELLOW"  "_worker_aro_update"
 cmd_aro_update_watchdog() { _prompt_and_run "Aro Update Watchdog" "CYAN" "_worker_aro_watchdog";   }
 cmd_ct_restart()  { _prompt_and_run "CT Restart"  "GREEN"   "_worker_ct_power" "restart" "GREEN";  }
 cmd_ct_stop()     { _prompt_and_run "CT Stop"     "RED"     "_worker_ct_power" "stop"   "RED";     }
+cmd_connect_dashboard() { _prompt_and_run "Kết nối Dashboard" "CYAN" "_worker_connect_dashboard";  }
 
 # ── Open VNC (không dùng parallel vì mỗi CT cần logic riêng với iptables) ──
 cmd_open_vnc() {
