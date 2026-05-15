@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.7"
+APP_VERSION="1.8"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -37,6 +37,8 @@ MENU_NAMES+=("Check ARO Score");    MENU_DESCS+=("Kiểm tra điểm ARO node, t
 MENU_NAMES+=("Kết nối Dashboard");  MENU_DESCS+=("Enable ARO dashboard URL/API cho các CT đã chọn");             MENU_FUNCS+=("cmd_connect_dashboard")
 MENU_NAMES+=("Deploy ARO");         MENU_DESCS+=("Deploy ARO theo proxy từ /root/ct-list.csv");                  MENU_FUNCS+=("cmd_deploy_aro")
 MENU_NAMES+=("Shrink CT Disk");     MENU_DESCS+=("Shrink root disk LVM/ext4 của CT về dung lượng chọn");          MENU_FUNCS+=("cmd_shrink_ct_disk")
+MENU_NAMES+=("Telegram Off");       MENU_DESCS+=("Chạy aro-manager.sh tele-off trên các CT đã chọn");             MENU_FUNCS+=("cmd_telegram_off")
+MENU_NAMES+=("Telegram On");        MENU_DESCS+=("Chạy aro-manager.sh tele-on trên các CT đã chọn");              MENU_FUNCS+=("cmd_telegram_on")
 
 # ── Thêm lệnh mới bên dưới ──
 # MENU_NAMES+=("Tên lệnh"); MENU_DESCS+=("Mô tả"); MENU_FUNCS+=("cmd_ten_lenh")
@@ -70,6 +72,26 @@ parse_ct_input() {
     done
     [[ -z "$result" ]] && { echo -e "\n  ${RED}✗ Không có CT nào được nhập.${NC}" >&2; return 1; }
     echo "$result" | tr ' ' '\n' | sort -un | tr '\n' ' '
+}
+
+get_all_ct_ids() {
+    pct list 2>/dev/null | awk 'NR > 1 && $1 ~ /^[0-9]+$/ {print $1}' | sort -n | tr '\n' ' '
+}
+
+show_ct_inventory() {
+    local ids
+    ids=$(get_all_ct_ids)
+
+    if [[ -z "$ids" ]]; then
+        echo -e "  ${YELLOW}Không đọc được danh sách CT từ pct list.${NC}"
+        echo ""
+        return
+    fi
+
+    echo -e "  ${CYAN}Danh sách CT hiện có:${NC}"
+    echo "$ids" | tr ' ' '\n' | grep -v '^$' | \
+        awk 'NR % 5 == 1 {printf "  "} {printf "%-10s", $0} NR % 5 == 0 {print ""} END {if (NR % 5 != 0) print ""}'
+    echo ""
 }
 
 # ─────────────────────────────────────────────
@@ -739,8 +761,9 @@ _prompt_and_run() {
     echo -e "${BOLD}${WHITE}  ${title}${NC}"
     echo -e "${!color}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
     echo ""
-    echo -e "  ${DIM}Kết hợp dãy và số lẻ (vd: ${WHITE}220-222,225,230-232${DIM}):${NC}"
-    echo -ne "  ${YELLOW}CT range/ID: ${NC}"
+    show_ct_inventory
+    echo -e "  ${DIM}Kết hợp dãy và số lẻ (vd: ${WHITE}220-222,225,230-232${DIM}) hoặc nhập ${WHITE}all${DIM}:${NC}"
+    echo -ne "  ${YELLOW}CT range/ID/all: ${NC}"
     read -r input
 
     if [[ -z "$input" ]]; then
@@ -748,7 +771,14 @@ _prompt_and_run() {
     fi
 
     local ct_list
-    ct_list=$(parse_ct_input "$input") || { echo ""; return 1; }
+    if [[ "${input,,}" == "all" ]]; then
+        ct_list=$(get_all_ct_ids)
+        if [[ -z "$ct_list" ]]; then
+            echo -e "\n  ${RED}✗ Không có CT nào để xử lý.${NC}\n"; return 1
+        fi
+    else
+        ct_list=$(parse_ct_input "$input") || { echo ""; return 1; }
+    fi
     local ct_arr=($ct_list)
 
     echo ""
@@ -811,6 +841,8 @@ _prompt_and_run() {
 
 cmd_aro_report()  { _prompt_and_run "Aro Report"  "CYAN"    "_worker_aro_run"  "report"  "CYAN";   }
 cmd_aro_restart() { _prompt_and_run "Aro Restart" "RED"     "_worker_aro_run"  "restart" "RED";    }
+cmd_telegram_off(){ _prompt_and_run "Telegram Off" "RED"     "_worker_aro_run"  "tele-off" "RED";   }
+cmd_telegram_on() { _prompt_and_run "Telegram On"  "GREEN"   "_worker_aro_run"  "tele-on"  "GREEN"; }
 cmd_aro_update()  { _prompt_and_run "Aro Update"  "YELLOW"  "_worker_aro_update";                  }
 cmd_aro_update_watchdog() { _prompt_and_run "Aro Update Watchdog" "CYAN" "_worker_aro_watchdog";   }
 cmd_ct_restart()  { _prompt_and_run "CT Restart"  "GREEN"   "_worker_ct_power" "restart" "GREEN";  }

@@ -26,6 +26,8 @@ Chạy lệnh này trên bất kỳ PVE nào — tự động cài mới hoặc 
 | 10 | Kết nối Dashboard | Enable ARO dashboard URL/API cho các CT đã chọn |
 | 11 | Deploy ARO | Deploy ARO theo proxy từ `/root/ct-list.csv` |
 | 12 | Shrink CT Disk | Shrink root disk LVM/ext4 của CT về dung lượng chọn |
+| 13 | Telegram Off | Chạy `aro-manager.sh tele-off` trên các CT đã chọn |
+| 14 | Telegram On | Chạy `aro-manager.sh tele-on` trên các CT đã chọn |
 
 ## Quy trình cập nhật script
 
