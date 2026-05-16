@@ -16,7 +16,8 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.9"
+APP_VERSION="1.10"
+APP_BUILD_TS="2026-05-16 00:00 +07"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -377,6 +378,28 @@ _shell_quote() {
     printf "%q" "$1"
 }
 
+_build_curl_proxy_args() {
+    local proxy="$1"
+
+    if [[ "$proxy" == *"://"* ]]; then
+        printf -- "-x %s" "$(_shell_quote "$proxy")"
+        return 0
+    fi
+
+    IFS=':' read -r proxy_host proxy_port proxy_user proxy_pass proxy_extra <<< "$proxy"
+    if [[ -z "$proxy_host" || -z "$proxy_port" || -z "$proxy_user" || -z "$proxy_pass" || -n "$proxy_extra" ]]; then
+        return 1
+    fi
+
+    if ! [[ "$proxy_port" =~ ^[0-9]+$ ]] || (( proxy_port < 1 || proxy_port > 65535 )); then
+        return 1
+    fi
+
+    printf -- "--socks5-hostname %s --proxy-user %s" \
+        "$(_shell_quote "${proxy_host}:${proxy_port}")" \
+        "$(_shell_quote "${proxy_user}:${proxy_pass}")"
+}
+
 _deploy_config_path() {
     echo "${HOME:-/root}/deploy-aro.conf"
 }
@@ -571,11 +594,19 @@ _worker_deploy_aro() {
         return
     fi
 
-    local proxy_check_output proxy_ip q_proxy_check
-    q_proxy_check=$(_shell_quote "$proxy")
+    local proxy_check_output proxy_ip curl_proxy_args
     echo -e "  ${CYAN}[CT ${ctid}] Kiểm tra proxy trước khi deploy...${NC}"
+    if ! curl_proxy_args=$(_build_curl_proxy_args "$proxy"); then
+        echo -e "  ${RED}[CT ${ctid}] ✗ Proxy sai định dạng${NC}"
+        echo -e "  ${DIM}[CT ${ctid}] Hỗ trợ: host:port:user:pass hoặc socks5h://user:pass@host:port${NC}"
+        echo -e "  ${DIM}[CT ${ctid}] Proxy:${NC} ${proxy}"
+        echo "${ctid}|${proxy}" > "$tmpdir/${ctid}.proxy_fail"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
     proxy_check_output=$(pct exec "$ctid" -- bash -c \
-        "command -v curl >/dev/null 2>&1 || { echo 'curl not found'; exit 127; }; curl -4 -fsS --connect-timeout 10 --max-time 20 -x ${q_proxy_check} https://api.ipify.org" 2>&1)
+        "command -v curl >/dev/null 2>&1 || { echo 'curl not found'; exit 127; }; curl -4 -fsS --connect-timeout 10 --max-time 20 ${curl_proxy_args} https://api.ipify.org" 2>&1)
     local proxy_rc=$?
 
     if (( proxy_rc != 0 )) || [[ -z "$proxy_check_output" ]]; then
@@ -1555,8 +1586,8 @@ draw_header() {
     echo ""
     echo -e "${BOLD}${MAGENTA}  ╔══════════════════════════════════════╗${NC}"
     echo -e "${BOLD}${MAGENTA}  ║${NC}  ${WHITE}${BOLD}✦  PROXMOX QUICK COMMANDS  ✦${NC}       ${BOLD}${MAGENTA}║${NC}"
-    echo -e "${BOLD}${MAGENTA}  ║${NC}              ${DIM}version ${APP_VERSION}${NC}              ${BOLD}${MAGENTA}║${NC}"
     echo -e "${BOLD}${MAGENTA}  ╚══════════════════════════════════════╝${NC}"
+    echo -e "  ${DIM}version ${APP_VERSION} · ${APP_BUILD_TS}${NC}"
     echo -e "  ${DIM}$(hostname) · $(date '+%Y-%m-%d %H:%M')${NC}"
     echo ""
 }
