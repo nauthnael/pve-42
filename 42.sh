@@ -16,7 +16,7 @@ DIM='\033[2m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-APP_VERSION="1.8"
+APP_VERSION="1.9"
 
 # ─────────────────────────────────────────────
 #  MENU ITEMS
@@ -146,6 +146,7 @@ run_parallel() {
     local ct_arr=($ct_list)
     local ok=0 skipped=0 failed=0
     local failed_ids=()
+    local proxy_failed=()
     local total=${#ct_arr[@]} done_count=0
     local printed_ids=" "
 
@@ -171,6 +172,10 @@ run_parallel() {
                 skip) (( skipped++ )) ;;
                 fail) (( failed++ )); failed_ids+=("$ctid") ;;
             esac
+
+            if [[ -f "$tmpdir/${ctid}.proxy_fail" ]]; then
+                proxy_failed+=("$(cat "$tmpdir/${ctid}.proxy_fail")")
+            fi
 
             printed_ids+="${ctid} "
             echo ""
@@ -217,10 +222,16 @@ run_parallel() {
         {
             echo "__STATS__ ok=$ok skipped=$skipped failed=$failed"
             echo "__FAILED__ ${failed_ids[*]}"
+            for item in "${proxy_failed[@]}"; do
+                echo "__PROXY_FAILED__ $item"
+            done
         } > "$RUN_PARALLEL_STATS_FILE"
     else
         echo "__STATS__ ok=$ok skipped=$skipped failed=$failed"
         echo "__FAILED__ ${failed_ids[*]}"
+        for item in "${proxy_failed[@]}"; do
+            echo "__PROXY_FAILED__ $item"
+        done
     fi
 }
 
@@ -560,6 +571,25 @@ _worker_deploy_aro() {
         return
     fi
 
+    local proxy_check_output proxy_ip q_proxy_check
+    q_proxy_check=$(_shell_quote "$proxy")
+    echo -e "  ${CYAN}[CT ${ctid}] Kiểm tra proxy trước khi deploy...${NC}"
+    proxy_check_output=$(pct exec "$ctid" -- bash -c \
+        "command -v curl >/dev/null 2>&1 || { echo 'curl not found'; exit 127; }; curl -4 -fsS --connect-timeout 10 --max-time 20 -x ${q_proxy_check} https://api.ipify.org" 2>&1)
+    local proxy_rc=$?
+
+    if (( proxy_rc != 0 )) || [[ -z "$proxy_check_output" ]]; then
+        [[ -n "$proxy_check_output" ]] && echo "$proxy_check_output" | sed "s/^/  [CT ${ctid}] /"
+        echo -e "  ${RED}[CT ${ctid}] ✗ Proxy lỗi, bỏ qua deploy${NC}"
+        echo -e "  ${DIM}[CT ${ctid}] Proxy:${NC} ${proxy}"
+        echo "${ctid}|${proxy}" > "$tmpdir/${ctid}.proxy_fail"
+        echo "fail" > "$tmpdir/${ctid}.status"
+        return
+    fi
+
+    proxy_ip=$(echo "$proxy_check_output" | tail -1 | tr -d '\r')
+    echo -e "  ${GREEN}[CT ${ctid}] ✓ Proxy live${NC} ${DIM}(IP ra ngoài: ${proxy_ip})${NC}"
+
     echo -e "  ${CYAN}[CT ${ctid}] Đang tải aro-manager.sh...${NC}"
 
     local download_output size download_ok=false attempt
@@ -804,11 +834,12 @@ _prompt_and_run() {
         stats=$(cat "$stats_file")
         rm -f "$stats_file"
 
-        local ok skipped failed failed_list
+        local ok skipped failed failed_list proxy_failed_list
         ok=$(echo    "$stats" | grep -oP 'ok=\K[0-9]+')
         skipped=$(echo "$stats" | grep -oP 'skipped=\K[0-9]+')
         failed=$(echo  "$stats" | grep -oP 'failed=\K[0-9]+')
         failed_list=$(echo "$stats" | sed -n 's/^__FAILED__ //p' | head -1)
+        proxy_failed_list=$(echo "$stats" | sed -n 's/^__PROXY_FAILED__ //p')
 
         echo -e "${DIM}  ─────────────────────────────────────${NC}"
         local summary="  ${GREEN}✓ Hoàn thành:${NC} ${WHITE}${ok} CT OK${NC}"
@@ -1030,16 +1061,26 @@ cmd_deploy_aro() {
         stats=$(cat "$stats_file")
         rm -f "$stats_file"
 
-        local ok skipped failed failed_list
+        local ok skipped failed failed_list proxy_failed_list
         ok=$(echo    "$stats" | grep -oP 'ok=\K[0-9]+')
         skipped=$(echo "$stats" | grep -oP 'skipped=\K[0-9]+')
         failed=$(echo  "$stats" | grep -oP 'failed=\K[0-9]+')
         failed_list=$(echo "$stats" | sed -n 's/^__FAILED__ //p' | head -1)
+        proxy_failed_list=$(echo "$stats" | sed -n 's/^__PROXY_FAILED__ //p')
 
         echo -e "${DIM}  ─────────────────────────────────────${NC}"
         echo -e "  ${GREEN}Thành công:${NC} ${WHITE}${ok} CT${NC}"
         echo -e "  ${RED}Thất bại:${NC}   ${WHITE}${failed} CT${NC}"
         echo -e "  ${YELLOW}Bỏ qua:${NC}     ${WHITE}${skipped} CT${NC}"
+
+        if [[ -n "$proxy_failed_list" ]]; then
+            echo ""
+            echo -e "  ${RED}Proxy lỗi:${NC}"
+            echo "$proxy_failed_list" | while IFS='|' read -r bad_ct bad_proxy; do
+                [[ -z "$bad_ct" ]] && continue
+                echo -e "  ${WHITE}CT ${bad_ct}${NC}  ${bad_proxy}"
+            done
+        fi
 
         if [[ "$failed" -gt 0 && -n "$failed_list" ]]; then
             echo ""
